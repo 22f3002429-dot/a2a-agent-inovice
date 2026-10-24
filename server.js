@@ -11,7 +11,6 @@ const MODEL = (process.env.OPENROUTER_MODEL || process.env.AI_MODEL || 'openai/g
 // Endpoint is auto-detected from the key: gsk_... = Groq, sk-or-... = OpenRouter (override with AI_BASE_URL)
 const AI_URL = process.env.AI_BASE_URL || (API_KEY.startsWith('gsk_') ? 'https://api.groq.com/openai/v1' : (API_KEY.startsWith('sk-or-') ? 'https://openrouter.ai/api/v1' : 'https://api.groq.com/openai/v1'));
 let activeModel = MODEL;
-const MODEL_PREF = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant', 'qwen/qwen3.8-27b', 'meta-llama/llama-4-scout-17b-16e-instruct'];
 const VERSION = 'v12';
 const MOCK_AI = process.env.MOCK_AI === '1';
 const CHUNK = Math.max(1, parseInt(process.env.CHUNK_SIZE || '6', 10));
