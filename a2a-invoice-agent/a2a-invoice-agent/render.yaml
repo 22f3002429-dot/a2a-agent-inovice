@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: a2a-invoice-agent
+    runtime: node
+    plan: free
+    buildCommand: echo "no build"
+    startCommand: node server.js
+    envVars:
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openai/gpt-4o-mini
+      - key: PUBLIC_BASE_URL
+        sync: false
