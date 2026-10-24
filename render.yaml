@@ -6,9 +6,9 @@ services:
     buildCommand: echo "no build"
     startCommand: node server.js
     envVars:
-      - key: GROQ_API_KEY
+      - key: OPENROUTER_API_KEY
         sync: false
-      - key: AI_MODEL
-        value: llama-3.3-70b-versatile
+      - key: OPENROUTER_MODEL
+        value: openai/gpt-oss-120b
       - key: PUBLIC_BASE_URL
         sync: false
