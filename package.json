@@ -1,0 +1,9 @@
+{
+  "name": "a2a-invoice-agent",
+  "version": "1.0.0",
+  "description": "A2A 1.0 HTTP+JSON invoice action agent using OpenRouter",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "test": "node test/smoke.js" },
+  "engines": { "node": ">=18" },
+  "license": "MIT"
+}
