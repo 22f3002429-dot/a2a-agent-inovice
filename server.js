@@ -7,7 +7,7 @@ const path = require('path');
 // ---------- config ----------
 const PORT = process.env.PORT || 8080;
 const API_KEY = (process.env.OPENROUTER_API_KEY || process.env.AI_API_KEY || process.env.GROQ_API_KEY || '').trim();
-const MODEL = (process.env.OPENROUTER_MODEL || process.env.AI_MODEL || 'openai/gpt-oss-120b').trim();
+const MODEL = (process.env.OPENROUTER_MODEL || process.env.AI_MODEL || 'openai/gpt-oss-20b').trim();
 // Endpoint is auto-detected from the key: gsk_... = Groq, sk-or-... = OpenRouter (override with AI_BASE_URL)
 const AI_URL = process.env.AI_BASE_URL || (API_KEY.startsWith('gsk_') ? 'https://api.groq.com/openai/v1' : (API_KEY.startsWith('sk-or-') ? 'https://openrouter.ai/api/v1' : 'https://api.groq.com/openai/v1'));
 let activeModel = MODEL;
