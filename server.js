@@ -12,6 +12,7 @@ const MODEL = (process.env.OPENROUTER_MODEL || process.env.AI_MODEL || 'openai/g
 const AI_URL = process.env.AI_BASE_URL || (API_KEY.startsWith('gsk_') ? 'https://api.groq.com/openai/v1' : (API_KEY.startsWith('sk-or-') ? 'https://openrouter.ai/api/v1' : 'https://api.groq.com/openai/v1'));
 let activeModel = MODEL;
 const MODEL_PREF = ['openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant', 'qwen/qwen3.8-27b', 'meta-llama/llama-4-scout-17b-16e-instruct'];
+const VERSION = 'v12';
 const MOCK_AI = process.env.MOCK_AI === '1';
 const CHUNK = Math.max(1, parseInt(process.env.CHUNK_SIZE || '6', 10));
 const ALLOWED = (process.env.AGENT_TOKENS || '').split(',').map(s => s.trim()).filter(Boolean);
@@ -85,7 +86,10 @@ function card(req) {
     name: 'Invoice Action Agent',
     description: 'Reads invoice packages, proposes one safe business action per invoice with cited evidence, and executes only grader-accepted proposals.',
     version: '1.0.0',
-    supportedInterfaces: [{ url: PUBLIC_BASE_URL, protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' }],
+    supportedInterfaces: (() => {
+      const alt = PUBLIC_BASE_URL.endsWith('/') ? PUBLIC_BASE_URL.replace(/\/+$/, '') : PUBLIC_BASE_URL + '/';
+      return [PUBLIC_BASE_URL, alt].filter((u, i, a) => u && a.indexOf(u) === i).map(u => ({ url: u, protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' }));
+    })(),
     capabilities: { streaming: false, pushNotifications: false },
     securitySchemes: { bearer: { httpAuthSecurityScheme: { scheme: 'Bearer' } } },
     securityRequirements: [{ schemes: { bearer: { list: [] } } }],
@@ -153,7 +157,7 @@ async function listModels() {
 
 // Pool of models: each Groq model has its own tokens-per-minute budget, so rotate when one is rate-limited.
 const POOL = (process.env.MODEL_POOL ? process.env.MODEL_POOL.split(',') : [MODEL, 'openai/gpt-oss-120b', 'llama-3.3-70b-versatile', 'openai/gpt-oss-20b', 'llama-3.1-8b-instant'])
-  .map(x => x.trim()).filter((m, i, arr) => m && arr.indexOf(m) === i);
+  .map(x => x.trim()).filter((m, i, arr) => m && arr.indexOf(m) === i && !/whisper|guard|orpheus|safeguard|embed|tts|moderation/i.test(m));
 const cool = {}; const dead = new Set();
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
@@ -229,14 +233,24 @@ async function callModel(items, batchMeta, deadline) {
 function mockModel(items) {
   return items.map(it => ({ packageId: it.id, controllingParagraph: it.dg.ctrl && it.dg.ctrl.id, action: 'hold_invoice', reason: 'Mock decision for protocol testing.', facts: it.dg.facts || { vendorName: 'Mock', invoiceNumber: 'M-1', amountMinor: 100, currency: 'USD' } }));
 }
+function heuristicAction(t) {
+  t = String(t || '').toLowerCase();
+  if (/already (been )?paid|previously paid|was paid|duplicate (of|payment)|settled earlier/.test(t) && !/not a duplicate|different invoice|does not duplicate/.test(t)) return 'reject_duplicate';
+  if (/callback|until .{0,60}(verif|confirm|clos|complet)|forbids remittance|hold until|pending verification|changed (bank|instruction|destination)|destination-account|verification (is )?(pending|outstanding)/.test(t)) return 'hold_invoice';
+  if (/exceed|above the .{0,40}(limit|authority)|delegated authority|requires .{0,40}approv|needs .{0,40}approv|approval from|higher authority/.test(t) && !/does not exceed|within (the )?(delegated|autonomous)/.test(t)) return 'request_approval';
+  if (/mismatch|conflict|discrepan|does not match|disagree|differs from/.test(t)) return 'open_exception';
+  if (/within .{0,40}(authority|limit)|fully reconciled|three-way match|no discrepanc/.test(t)) return 'settle_invoice';
+  return null;
+}
 function normalize(it, d) {
   const dg = it.dg;
   const ok0 = !!(d && ACTIONS.includes(d.action));
-  const action = ok0 ? d.action : 'open_exception';
   let para = dg.ctrl;
   if (!para && d) para = dg.paras.find(x => x.id === d.controllingParagraph && x.refs.length >= 2);
   if (!para) para = dg.paras.find(x => x.refs.length === 3 && !DECOYRE.test(x.text)) || dg.paras.find(x => x.refs.length >= 2) || null;
   const refs = para ? para.refs.slice(0, 3) : [];
+  const heur = ok0 ? null : heuristicAction(para ? para.text : dg.paras.map(x => x.text).join(' '));
+  const action = ok0 ? d.action : (heur || 'open_exception');
   const f = dg.facts || (d && d.facts) || {};
   const amt = Math.round(Number(f.amountMinor));
   const facts = {
@@ -409,14 +423,14 @@ function handleCancel(res, principal, id) {
 }
 
 async function selfTest(req) {
-  const out = { model: activeModel, aiUrl: AI_URL, keySet: !!API_KEY, advertisedBase: card(req).supportedInterfaces[0].url, publicBaseEnv: PUBLIC_BASE_ENV || '(not set, derived from request)' };
+  const out = { version: VERSION, pool: POOL, model: POOL[0], aiUrl: AI_URL, keySet: !!API_KEY, advertisedBase: card(req).supportedInterfaces[0].url, publicBaseEnv: PUBLIC_BASE_ENV || '(not set, derived from request)' };
   if (MOCK_AI) { out.result = 'MOCK_AI'; return out; }
   try {
     const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 20000);
     const r = await fetch(AI_URL.replace(/\/+$/, '') + '/chat/completions', {
       method: 'POST', signal: ctrl.signal,
       headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: activeModel, temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'Reply with JSON {"ok":true}' }, { role: 'user', content: 'ping' }] })
+      body: JSON.stringify({ model: POOL[0], temperature: 0, response_format: { type: 'json_object' }, messages: [{ role: 'system', content: 'Reply with JSON {"ok":true}' }, { role: 'user', content: 'ping' }] })
     });
     clearTimeout(t);
     out.status = r.status; out.body = (await r.text()).slice(0, 300);
@@ -436,7 +450,7 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, card(req), 'application/json');
     }
     if (p === '/selftest') return send(res, 200, await selfTest(req), 'application/json');
-    if (p === '/' || p === '/healthz') return send(res, 200, { ok: true, model: activeModel, aiUrl: AI_URL, keySet: !!API_KEY, advertisedBase: card(req).supportedInterfaces[0].url, lastModelError }, 'application/json');
+    if (p === '/' || p === '/healthz') return send(res, 200, { ok: true, version: VERSION, pool: POOL.filter(m => !dead.has(m)), cooling: Object.keys(cool).filter(m => cool[m] > Date.now()), model: POOL[0], aiUrl: AI_URL, keySet: !!API_KEY, advertisedBase: card(req).supportedInterfaces[0].url, lastModelError }, 'application/json');
     const principal = principalOf(req);
     if (!principal) return err(res, 401, 'Authentication required');
     if (req.headers['a2a-version'] !== '1.0') return err(res, 400, 'Unsupported A2A version');
