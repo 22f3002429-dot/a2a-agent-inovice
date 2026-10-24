@@ -1,6 +1,6 @@
 # A2A Invoice Action Agent
 
-Zero-dependency Node.js (>=18) A2A 1.0 HTTP+JSON agent. AI decisions via OpenRouter.
+Zero-dependency Node.js (>=18) A2A 1.0 HTTP+JSON agent. AI via Groq (free) or OpenRouter (set AI_BASE_URL).
 
 ## Env vars
 | Name | Meaning |

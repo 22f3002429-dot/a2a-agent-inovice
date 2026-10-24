@@ -6,10 +6,11 @@ const path = require('path');
 
 // ---------- config ----------
 const PORT = process.env.PORT || 8080;
-const API_KEY = process.env.OPENROUTER_API_KEY || '';
-const MODEL = process.env.OPENROUTER_MODEL || 'openai/gpt-4o-mini';
+const API_KEY = process.env.AI_API_KEY || process.env.GROQ_API_KEY || process.env.OPENROUTER_API_KEY || '';
+const MODEL = process.env.AI_MODEL || process.env.OPENROUTER_MODEL || 'llama-3.3-70b-versatile';
+const AI_URL = process.env.AI_BASE_URL || (process.env.OPENROUTER_API_KEY ? 'https://openrouter.ai/api/v1' : 'https://api.groq.com/openai/v1');
 const MOCK_AI = process.env.MOCK_AI === '1';
-const CHUNK = Math.max(1, parseInt(process.env.CHUNK_SIZE || '12', 10));
+const CHUNK = Math.max(1, parseInt(process.env.CHUNK_SIZE || '6', 10));
 const ALLOWED = (process.env.AGENT_TOKENS || '').split(',').map(s => s.trim()).filter(Boolean);
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || `http://localhost:${PORT}`).replace(/\/+$/, '');
@@ -107,32 +108,55 @@ function stripIds(p) {
 }
 const BR = /\[[^\[\]\n]{2,200}\]/g;
 
-const SYSTEM = `You are an accounts-payable control analyst. For EACH invoice package choose exactly one action:
-- settle_invoice: valid, reconciled, within autonomous approval authority.
-- request_approval: commercially valid but exceeds delegated authority / needs a named approver.
-- hold_invoice: payment pauses until a stated verification completes (e.g. bank detail check, receipt of goods, tax id).
-- reject_duplicate: the SAME commercial invoice (same vendor, invoice number, amount) was already paid. A payment for a DIFFERENT invoice number is NOT a duplicate.
-- open_exception: material records conflict (PO vs invoice vs receipt vs bank) and need an exception workflow.
-Rules: documents mix useful facts with archive examples, training decoys, negations ("no hold is required"), quoted old policy and irrelevant action words. Find the paragraph that actually determines the action for THIS invoice under the stated current policy revision. Ignore cover-sheet references, archive examples and training decoys.
-evidenceRefs: exactly the three decisive bracketed references (copied VERBATIM, including the square brackets) from that deciding paragraph.
-facts: vendorName, invoiceNumber, amountMinor (integer minor units, e.g. rupees*100 / paise), currency (ISO code) for the invoice being processed.
-Return ONLY JSON: {"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["[..]","[..]","[..]"],"reason":"one or two sentences"}]}`;
+const SYSTEM = `You are a careful accounts-payable control analyst. Decide ONE action per invoice package.
 
-async function callModel(items, batchMeta) {
+ACTIONS
+- settle_invoice: valid, reconciled (PO/receipt/amount agree), within autonomous approval authority, nothing pending.
+- request_approval: commercially valid but the amount/terms exceed delegated authority; a named approver/higher authority must approve first.
+- hold_invoice: payment pauses until a STATED verification completes (bank-detail callback, goods receipt, tax/ID check, etc.).
+- reject_duplicate: the SAME commercial invoice (same vendor + same invoice number + same amount) was already PAID. A payment for a different invoice number is NOT a duplicate, even if vendor or amount look similar.
+- open_exception: material records conflict (invoice vs PO vs receipt vs bank/vendor master) and need an exception workflow.
+
+HOW TO READ THE DOCUMENTS
+1. Packages mix real facts with noise: cover sheets, archive/old examples, training decoys, quoted superseded policy, negations ("no hold is required", "not a duplicate") and irrelevant action words. Words like "approve", "hold" or "duplicate" appearing in noise do NOT decide anything.
+2. Find the ONE paragraph that states the controlling facts for THIS invoice under the CURRENT policy revision. Ignore cover-sheet text, archive examples and anything labelled training/example/sample/superseded/previous.
+3. Compare the numbers yourself (invoice amount vs authority limit, PO vs invoice amount, invoice number vs paid-invoice number) before choosing.
+4. Pick the single action the controlling paragraph supports.
+
+OUTPUT
+"decisiveText": copy VERBATIM the first 12-20 words of the controlling paragraph (must appear exactly in the package).
+"evidenceRefs": the exactly three bracketed references (copy verbatim WITH brackets) that sit in that controlling paragraph. Never use the cover-sheet reference or refs from archive/decoy text.
+"facts": vendorName, invoiceNumber, amountMinor (integer minor units: 1,234.50 -> 123450), currency (ISO code) of the invoice being processed.
+"analysis": 1-2 sentences naming the facts that decide the action.
+Return ONLY JSON:
+{"decisions":[{"packageId":"...","analysis":"...","decisiveText":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...","amountMinor":0,"currency":"INR"},"evidenceRefs":["[..]","[..]","[..]"],"reason":"one or two sentences explaining how the evidence supports the action"}]}`;
+
+async function callModel(items, batchMeta, deadline) {
   const body = items.map(it => `### PACKAGE ${it.id}\n${canon(it.p)}`).join('\n\n');
   const user = `Policy revision: ${batchMeta.policyRevision}\nReturn one decision per package (${items.length} packages).\n\n${body}`;
   const ctrl = new AbortController();
-  const t = setTimeout(() => ctrl.abort(), 40000);
+  const left = () => deadline - Date.now();
+  const t = setTimeout(() => ctrl.abort(), Math.max(1000, left()));
   try {
-    const r = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-      method: 'POST', signal: ctrl.signal,
-      headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json', 'X-Title': 'a2a-invoice-agent' },
-      body: JSON.stringify({
-        model: MODEL, temperature: 0, response_format: { type: 'json_object' },
-        messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }]
-      })
-    });
-    if (!r.ok) throw new Error('model http ' + r.status);
+    let r;
+    for (let a = 0; a < 3; a++) {
+      r = await fetch(AI_URL.replace(/\/+$/, '') + '/chat/completions', {
+        method: 'POST', signal: ctrl.signal,
+        headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model: MODEL, temperature: 0, response_format: { type: 'json_object' },
+          messages: [{ role: 'system', content: SYSTEM }, { role: 'user', content: user }]
+        })
+      });
+      if (r.status !== 429) break;
+      const w = Math.min(8, parseFloat(r.headers.get('retry-after')) || 4);
+      if (left() < (w + 6) * 1000) break;
+      await new Promise(x => setTimeout(x, w * 1000));
+    }
+    if (!r.ok) {
+      let snip = ''; try { snip = (await r.text()).slice(0, 300); } catch (_) {}
+      throw new Error('model http ' + r.status + ' ' + snip);
+    }
     const j = await r.json();
     const txt = j.choices[0].message.content;
     const m = /\{[\s\S]*\}/.exec(txt);
@@ -145,6 +169,18 @@ function mockModel(items) {
     return { packageId: it.id, action: 'open_exception', facts: { vendorName: 'Mock', invoiceNumber: 'M-1', amountMinor: 100, currency: 'INR' }, evidenceRefs: refs, reason: 'Mock decision for protocol testing.' };
   });
 }
+function paraRefs(text, snippet) {
+  if (!snippet) return null;
+  const sn = String(snippet).replace(/\s+/g, ' ').trim().slice(0, 60);
+  if (sn.length < 12) return null;
+  for (const para of text.split(/\n+/)) {
+    if (para.replace(/\s+/g, ' ').includes(sn)) {
+      const r = [...new Set(para.match(BR) || [])];
+      if (r.length >= 2 && r.length <= 4) return r.slice(0, 3);
+    }
+  }
+  return null;
+}
 function normalize(it, d) {
   const text = flatText(it.p).join('\n');
   let ok = d && ACTIONS.includes(d.action);
@@ -155,6 +191,8 @@ function normalize(it, d) {
     return null;
   }).filter(Boolean);
   refs = [...new Set(refs)];
+  const pr = d && paraRefs(text, d.decisiveText);
+  if (pr) refs = pr;
   if (refs.length < 3) { // top up from the document so there is always evidence
     for (const r of (text.match(BR) || [])) { if (refs.length >= 3) break; if (!refs.includes(r)) refs.push(r); }
     ok = ok && refs.length >= 2;
@@ -167,34 +205,44 @@ function normalize(it, d) {
     amountMinor: Number.isFinite(amt) ? amt : 0,
     currency: String(f.currency || 'INR').toUpperCase()
   };
-  return { action, facts, evidenceRefs: refs.slice(0, 3), reason: String((d && d.reason) || '').slice(0, 600), good: !!ok && !!d };
+  return { action, facts, evidenceRefs: refs.slice(0, 3), reason: String((d && (d.reason || d.analysis)) || '').slice(0, 600), good: !!ok && !!d };
 }
 
 const aiInflight = new Map();
 async function decideAll(batch) {
   const items = batch.packages.map(p => ({ p, id: pidOf(p), key: sha(canon(stripIds(p))) }));
+  try { console.log('SAMPLE_PACKAGE ' + JSON.stringify(batch.packages[0]).slice(0, 7000)); } catch (_) {}
   const need = [];
   const seen = new Set();
   for (const it of items) {
     if (state.cache[it.key] || aiInflight.has(it.key) || seen.has(it.key)) continue;
     seen.add(it.key); need.push(it);
   }
-  for (let i = 0; i < need.length; i += CHUNK) {
-    const chunk = need.slice(i, i + CHUNK);
-    const prom = (async () => {
-      let ds;
-      try { ds = MOCK_AI ? mockModel(chunk) : await callModel(chunk, batch); }
-      catch (e) { try { ds = MOCK_AI ? mockModel(chunk) : await callModel(chunk, batch); } catch (e2) { ds = null; } }
-      if (!ds) throw new Error('model unavailable');
-      const byId = new Map(ds.map(d => [String(d.packageId), d]));
+  if (need.length) {
+    const deadline = Date.now() + 36000;
+    const run = async (chunk) => {
+      let ds = null;
+      try { ds = MOCK_AI ? mockModel(chunk) : await callModel(chunk, batch, deadline); }
+      catch (e) {
+        console.log('MODEL_ERROR ' + String(e.message).slice(0, 400));
+        if (chunk.length > 1 && deadline - Date.now() > 4000) {
+          const h = Math.ceil(chunk.length / 2);
+          await run(chunk.slice(0, h)); await run(chunk.slice(h));
+          return;
+        }
+      }
+      const byId = new Map((ds || []).map(d => [String(d.packageId), d]));
       for (const it of chunk) {
         const n = normalize(it, byId.get(String(it.id)));
-        if (n.good) state.cache[it.key] = n; else state.cache[it.key] = Object.assign(n, { transient: true });
+        state.cache[it.key] = n.good ? n : Object.assign(n, { transient: true });
       }
+    };
+    const prom = (async () => {
+      for (let i = 0; i < need.length; i += CHUNK) await run(need.slice(i, i + CHUNK));
       save();
     })();
-    chunk.forEach(it => aiInflight.set(it.key, prom));
-    prom.then(() => chunk.forEach(it => aiInflight.delete(it.key)), () => chunk.forEach(it => aiInflight.delete(it.key)));
+    need.forEach(it => aiInflight.set(it.key, prom));
+    prom.then(() => need.forEach(it => aiInflight.delete(it.key)), () => need.forEach(it => aiInflight.delete(it.key)));
   }
   await Promise.all(items.map(it => aiInflight.get(it.key)).filter(Boolean));
   return items.map(it => {
